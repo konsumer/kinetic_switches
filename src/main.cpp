@@ -15,7 +15,6 @@
 #define TOLERANCE        40
 #define REFIRE_GUARD_MS  1500
 #define PORTAL_HOLD_MS   3000
-#define PRESENCE_TIMEOUT_MS 30000
 
 // ---- KineticSwitch -------------------------------------------------------------
 
@@ -27,7 +26,6 @@ public:
     KineticSwitch(const char* n, const char* u = "") : name(n), url(u) {}
     virtual bool        match(const char* buf, int len) = 0;
     virtual const char* pattern() = 0;
-    bool isPresent() { return lastPressMs > 0 && (millis() - lastPressMs) < PRESENCE_TIMEOUT_MS; }
 };
 
 class PatternSwitch : public KineticSwitch {
@@ -43,42 +41,34 @@ public:
 Preferences prefs;
 String      wifi_ssid, wifi_pass;
 std::vector<KineticSwitch*> switches;
-bool     has_ip_cache = false;
-uint32_t cached_ip = 0, cached_gw = 0, cached_sn = 0, cached_dns = 0;
 
 void loadConfig() {
     prefs.begin("ks", true);
-    wifi_ssid    = prefs.getString("ssid", "");
-    wifi_pass    = prefs.getString("pass", "");
-    String sw_j  = prefs.getString("sw",   "[]");
-    has_ip_cache = prefs.getBool("ipc", false);
-    cached_ip    = prefs.getUInt("ip",  0);
-    cached_gw    = prefs.getUInt("gw",  0);
-    cached_sn    = prefs.getUInt("sn",  0);
-    cached_dns   = prefs.getUInt("dns", 0);
+    wifi_ssid   = prefs.getString("ssid", "");
+    wifi_pass   = prefs.getString("pass", "");
+    String sw_j = prefs.getString("sw",   "[]");
     prefs.end();
 
-    Serial.printf("loadConfig: ssid='%s' sw_j='%s'\n", wifi_ssid.c_str(), sw_j.c_str());
-    for (auto s : switches) delete s;
+    for (auto s : switches) {
+        delete s;
+    }
+    
     switches.clear();
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, sw_j);
-    if (err) {
-        Serial.printf("loadConfig: JSON parse error: %s\n", err.c_str());
-    } else if (!doc.is<JsonArray>()) {
-        Serial.println("loadConfig: JSON is not array");
-    } else {
+    if (!deserializeJson(doc, sw_j) && doc.is<JsonArray>()) {
         for (JsonObject o : doc.as<JsonArray>()) {
             const char* n = o["n"]; const char* p = o["p"]; const char* u = o["u"];
-            Serial.printf("loadConfig: sw n='%s' p='%s' u='%s'\n", n?n:"null", p?p:"null", u?u:"");
-            if (n && p) switches.push_back(new PatternSwitch(n, p, u ? u : ""));
+            if (n && p) {
+                switches.push_back(new PatternSwitch(n, p, u ? u : ""));
+            }
         }
-    }
-    if (switches.empty()) {
-        Serial.println("loadConfig: no switches in NVS, using defaults");
-        switches.push_back(new PatternSwitch("Switch A", "8e8e88e88888", ""));
-        switches.push_back(new PatternSwitch("Switch B", "eeeee8888e8e8888", ""));
-        switches.push_back(new PatternSwitch("Switch C", "eeeee888888ee888", ""));
+
+    // if (switches.empty()) {
+    //     switches.push_back(new PatternSwitch("Switch A", "8e8e88e88888", ""));
+    //     switches.push_back(new PatternSwitch("Switch B", "eeeee8888e8e8888", ""));
+    //     switches.push_back(new PatternSwitch("Switch C", "eeeee888888ee888", ""));
+    // }
+
     }
 }
 
@@ -91,25 +81,11 @@ void saveConfig() {
         o["u"] = s->url.c_str();
     }
     String sw_j; serializeJson(doc, sw_j);
-    Serial.printf("saveConfig: ssid='%s' sw_j='%s'\n", wifi_ssid.c_str(), sw_j.c_str());
     prefs.begin("ks", false);
     prefs.putString("ssid", wifi_ssid);
     prefs.putString("pass", wifi_pass);
-    bool ok = prefs.putString("sw", sw_j);
-    Serial.printf("saveConfig: putString sw -> %s\n", ok ? "ok" : "FAIL");
+    prefs.putString("sw", sw_j);
     prefs.end();
-}
-
-void saveIpCache() {
-    prefs.begin("ks", false);
-    prefs.putBool("ipc", true);
-    prefs.putUInt("ip",  (uint32_t)WiFi.localIP());
-    prefs.putUInt("gw",  (uint32_t)WiFi.gatewayIP());
-    prefs.putUInt("sn",  (uint32_t)WiFi.subnetMask());
-    prefs.putUInt("dns", (uint32_t)WiFi.dnsIP());
-    prefs.end();
-    has_ip_cache = true;
-    Serial.println("DHCP cached");
 }
 
 // ---- CC1101 / RMT --------------------------------------------------------------
@@ -145,7 +121,9 @@ volatile bool carrier_present = false;
 RingbufHandle_t rmtRingBuf    = nullptr;
 
 static inline char classify(uint32_t us) {
-    if (us < 15) return '?';
+    if (us < 15) {
+        return '?';
+    }
     static const struct { uint8_t mult; char ch; } syms[] = {
         {1,'8'},{3,'e'},{4,'f'},{8,'F'}
     };
@@ -154,7 +132,10 @@ static inline char classify(uint32_t us) {
         uint32_t target = (uint32_t)SYMBOL_US * syms[i].mult;
         uint32_t tol    = target * TOLERANCE / 100;
         uint32_t err    = us > target ? us - target : target - us;
-        if (err <= tol && err < best_err) { best = syms[i].ch; best_err = err; }
+        if (err <= tol && err < best_err) {
+            best = syms[i].ch;
+            best_err = err;
+        }
     }
     return best;
 }
@@ -166,7 +147,9 @@ void IRAM_ATTR gdo2_cs_isr() {
 // ---- URL trigger ---------------------------------------------------------------
 
 void callUrl(const String& url) {
-    if (url.isEmpty()) return;
+    if (url.isEmpty()) {
+        return;
+    }
     HTTPClient http;
     if (url.startsWith("https")) {
         static WiFiClientSecure sc;
@@ -175,8 +158,7 @@ void callUrl(const String& url) {
     } else {
         http.begin(url);
     }
-    int code = http.GET();
-    Serial.printf("URL → %d\n", code);
+    Serial.printf("URL → %d\n", http.GET());
     http.end();
 }
 
@@ -186,9 +168,13 @@ void processBurst(char* expanded, int ei) {
     static int      last_sw      = -1;
     static uint32_t last_fire_ms = 0;
     for (int i = 0; i < (int)switches.size(); i++) {
-        if (!switches[i]->match(expanded, ei)) continue;
+        if (!switches[i]->match(expanded, ei)) {
+            continue;
+        }
         uint32_t now_ms = millis();
-        if (i == last_sw && (now_ms - last_fire_ms) < REFIRE_GUARD_MS) break;
+        if (i == last_sw && (now_ms - last_fire_ms) < REFIRE_GUARD_MS) {
+            break;
+        }
         switches[i]->lastPressMs = now_ms;
         Serial.printf(">>> %s\n", switches[i]->name.c_str());
         callUrl(switches[i]->url);
@@ -198,11 +184,14 @@ void processBurst(char* expanded, int ei) {
 }
 
 bool tryProcessPacket() {
-    if (!rmtRingBuf) return false;
+    if (!rmtRingBuf) {
+        return false;
+    }
     size_t rx_size;
     rmt_item32_t* items = (rmt_item32_t*)xRingbufferReceive(rmtRingBuf, &rx_size, 0);
-    if (!items) return false;
-
+    if (!items) {
+        return false;
+    }
     if (!carrier_present) {
         vRingbufferReturnItem(rmtRingBuf, items);
         return false;
@@ -214,13 +203,19 @@ bool tryProcessPacket() {
     for (int j = 0; j < n && ei < (int)sizeof(expanded) - 2; j++) {
         uint32_t us = items[j].level0 ? items[j].duration0 : items[j].duration1;
         char c = classify(us);
-        if (c == 'F') { expanded[ei++] = 'f'; expanded[ei++] = 'f'; }
-        else if (c != '?') expanded[ei++] = c;
+        if (c == 'F') {
+            expanded[ei++] = 'f';
+            expanded[ei++] = 'f';
+        } else if (c != '?') {
+            expanded[ei++] = c;
+        }
     }
     expanded[ei] = '\0';
     vRingbufferReturnItem(rmtRingBuf, items);
 
-    if (ei >= 8) processBurst(expanded, ei);
+    if (ei >= 8) {
+        processBurst(expanded, ei);
+    }
     return true;
 }
 
@@ -254,17 +249,28 @@ void handlePortalRoot() {
 }
 
 void handlePortalSave() {
-    if (!server.hasArg("plain")) { server.send(400, "text/plain", "Missing body"); return; }
+    if (!server.hasArg("plain")) {
+        server.send(400, "text/plain", "Missing body");
+        return;
+    }
+    
     JsonDocument doc;
-    if (deserializeJson(doc, server.arg("plain"))) { server.send(400, "text/plain", "Bad JSON"); return; }
+    
+    if (deserializeJson(doc, server.arg("plain"))) {
+        server.send(400, "text/plain", "Bad JSON");
+        return;
+    }
     wifi_ssid = doc["ssid"] | "";
     wifi_pass = doc["password"] | "";
-    for (auto s : switches) delete s;
+    for (auto s : switches) {
+        delete s;
+    }
     switches.clear();
     for (JsonObject sw : doc["switches"].as<JsonArray>()) {
         const char* nm = sw["name"]; const char* pt = sw["pattern"]; const char* u = sw["url"];
-        if (nm && pt && strlen(nm) && strlen(pt))
+        if (nm && pt && strlen(nm) && strlen(pt)) {
             switches.push_back(new PatternSwitch(nm, pt, u ? u : ""));
+        }
     }
     saveConfig();
     server.send(200, "application/json", "{\"status\":\"ok\"}");
@@ -282,7 +288,12 @@ void startCaptivePortal() {
     server.onNotFound(handlePortalRoot);
     server.begin();
     Serial.println("Portal: SSID=KineticSwitch  192.168.4.1");
-    while (true) { dns.processNextRequest(); server.handleClient(); tryProcessPacket(); delay(5); }
+    while (true) {
+        dns.processNextRequest();
+        server.handleClient();
+        tryProcessPacket();
+        delay(5);
+    }
 }
 
 // ---- Radio setup ---------------------------------------------------------------
@@ -291,14 +302,22 @@ void setupRadio() {
     spi.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
     int state = radio.begin();
     Serial.printf("CC1101: %s (%d)\n", state == RADIOLIB_ERR_NONE ? "OK" : "FAIL", state);
-    if (state != RADIOLIB_ERR_NONE) while (1) delay(100);
+    if (state != RADIOLIB_ERR_NONE) {
+        while (1) {
+            delay(100);
+        }
+    }
     radio.setFrequency(433.92);
     radio.setOOK(true);
     radio.setBitRate(28.6);
     radio.setRxBandwidth(200.0);
     state = radio.receiveDirectAsync();
     Serial.printf("receiveDirectAsync: %s (%d)\n", state == RADIOLIB_ERR_NONE ? "OK" : "FAIL", state);
-    if (state != RADIOLIB_ERR_NONE) while (1) delay(100);
+    if (state != RADIOLIB_ERR_NONE) {
+        while (1) {
+            delay(100);
+        }
+    }
     cc1101_write(0x07, 0x06);
     cc1101_write(0x1B, 0xC7);
     cc1101_write(0x1C, 0x00);
@@ -327,14 +346,13 @@ void setupRadio() {
 
 void wifiConnect() {
     WiFi.mode(WIFI_STA);
-    if (has_ip_cache)
-        WiFi.config(IPAddress(cached_ip), IPAddress(cached_gw),
-                    IPAddress(cached_sn), IPAddress(cached_dns));
     WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
     Serial.print("WiFi: connecting");
-    while (WiFi.status() != WL_CONNECTED) { delay(250); Serial.print("."); }
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(250);
+        Serial.print(".");
+    }
     Serial.printf("\nWiFi up: %s\n", WiFi.localIP().toString().c_str());
-    if (!has_ip_cache) saveIpCache();
 }
 
 // ---- Setup / Loop --------------------------------------------------------------
@@ -359,7 +377,11 @@ void setup() {
         while (digitalRead(PIN_BOOT) == LOW && millis() - held < PORTAL_HOLD_MS) delay(50);
         enterPortal = (digitalRead(PIN_BOOT) == LOW);
     }
-    if (enterPortal) { startCaptivePortal(); } // never returns
+    
+    if (enterPortal) {
+        // never returns
+        startCaptivePortal();
+    }
 
     wifiConnect();
     Serial.println("Radio listening.");
@@ -370,10 +392,10 @@ void loop() {
     static uint32_t last_hb   = 0;
     uint32_t now = millis();
 
-    {
-        uint8_t rssi_raw = cc1101_read_status(0x34);
-        int rssi_dbm = (rssi_raw >= 128) ? (rssi_raw - 256) / 2 - 74 : rssi_raw / 2 - 74;
-        if (rssi_dbm > peak_rssi) peak_rssi = rssi_dbm;
+    uint8_t rssi_raw = cc1101_read_status(0x34);
+    int rssi_dbm = (rssi_raw >= 128) ? (rssi_raw - 256) / 2 - 74 : rssi_raw / 2 - 74;
+    if (rssi_dbm > peak_rssi) {
+        peak_rssi = rssi_dbm;
     }
 
     if (now - last_hb > 5000) {
@@ -383,18 +405,18 @@ void loop() {
 
     tryProcessPacket();
 
-    {
-        static uint32_t boot_press_ms = 0;
-        if (digitalRead(PIN_BOOT) == LOW) {
-            if (!boot_press_ms) boot_press_ms = millis();
-            else if (millis() - boot_press_ms > PORTAL_HOLD_MS) {
-                Serial.println("BOOT held — entering portal");
-                startCaptivePortal(); // never returns; restarts after save
-            }
-        } else {
-            boot_press_ms = 0;
+    static uint32_t boot_press_ms = 0;
+    if (digitalRead(PIN_BOOT) == LOW) {
+        if (!boot_press_ms) {
+            boot_press_ms = millis();
+        } else if (millis() - boot_press_ms > PORTAL_HOLD_MS) {
+            Serial.println("BOOT held — entering portal");
+            startCaptivePortal();
         }
+    } else {
+        boot_press_ms = 0;
     }
+    
 
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("WiFi: lost, reconnecting");
@@ -402,6 +424,11 @@ void loop() {
     }
 
     static uint32_t led_on_ms = 0;
-    for (auto sw : switches) if (sw->lastPressMs > led_on_ms) led_on_ms = sw->lastPressMs;
+    for (auto sw : switches) {
+        if (sw->lastPressMs > led_on_ms) {
+            led_on_ms = sw->lastPressMs;
+        }
+    }
+
     digitalWrite(PIN_LED, (led_on_ms && millis() - led_on_ms < 100) ? HIGH : LOW);
 }
