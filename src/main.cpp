@@ -15,6 +15,7 @@
 #define TOLERANCE        40
 #define REFIRE_GUARD_MS  1500
 #define PORTAL_HOLD_MS   3000
+#define PRESENCE_TIMEOUT_MS 30000
 
 // ---- KineticSwitch -------------------------------------------------------------
 

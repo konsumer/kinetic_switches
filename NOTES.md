@@ -1,9 +1,8 @@
 - [Great Walkthrough Video](https://www.youtube.com/watch?v=tz_F4Tjhap0&t=997s)
 - [some analysis](https://tomasmcguinness.com/2025/02/04/detecting-a-433mhz-kinetic-push-switch-with-an-esp32-part-1/)
 - [more complete analysis](https://oliver-hihn.de/blog/1743491646169-kinetic-switch-hack/)
-- [Universal Radio Hacker](https://github.com/jopohl/urh)
 
-I used [Universal Radio Hacker](https://github.com/jopohl/urh) to figure this out:
+I used [Universal Radio Hacker](https://github.com/jopohl/urh) to figure this out for mine:
 
 - center: `433.92 MHz`
 - noise: `0.0026`
