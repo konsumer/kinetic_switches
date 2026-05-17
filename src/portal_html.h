@@ -45,8 +45,12 @@ const char PORTAL_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
   <h3>Add Switch</h3>
   <div class="row">
     <input type="text" id="new_name" placeholder="Name (e.g. Kitchen Light)" />
-    <input type="text" id="new_pat" placeholder="Pattern (e.g. 8e8e88e88888)" />
   </div>
+  <div class="row">
+    <input type="text" id="new_pat" placeholder="Pattern (e.g. 8e8e88e88888)" />
+    <button id="learn-btn" onclick="learnPattern()">Learn</button>
+  </div>
+  <div id="learn-status" style="font-size:0.85em;color:#888;margin-bottom:6px;"></div>
   <div class="row">
     <input type="text" id="new_url" placeholder="URL to call on press" />
   </div>
@@ -84,6 +88,32 @@ const char PORTAL_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
       document.getElementById('new_name').value = '';
       document.getElementById('new_pat').value = '';
       document.getElementById('new_url').value = '';
+    }
+
+    async function learnPattern() {
+      const btn = document.getElementById('learn-btn');
+      const st = document.getElementById('learn-status');
+      btn.disabled = true;
+      const deadline = Date.now() + 15000;
+      st.style.color = '#888';
+      st.textContent = 'Press your switch now...';
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 500));
+        try {
+          const r = await fetch('/pattern');
+          const d = await r.json();
+          if (d.pattern) {
+            document.getElementById('new_pat').value = d.pattern;
+            st.style.color = 'green';
+            st.textContent = 'Detected: ' + d.pattern;
+            btn.disabled = false;
+            return;
+          }
+        } catch(e) {}
+      }
+      st.style.color = 'red';
+      st.textContent = 'Nothing detected. Try again.';
+      btn.disabled = false;
     }
 
     function onSelChange() {

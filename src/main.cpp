@@ -119,6 +119,7 @@ static void cc1101_write(uint8_t addr, uint8_t val) {
 
 volatile bool carrier_present = false;
 RingbufHandle_t rmtRingBuf    = nullptr;
+String last_burst;
 
 static inline char classify(uint32_t us) {
     if (us < 15) {
@@ -214,6 +215,7 @@ bool tryProcessPacket() {
     vRingbufferReturnItem(rmtRingBuf, items);
 
     if (ei >= 8) {
+        last_burst = String(expanded);
         processBurst(expanded, ei);
     }
     return true;
@@ -285,6 +287,10 @@ void startCaptivePortal() {
     dns.start(53, "*", IPAddress(192, 168, 4, 1));
     server.on("/", HTTP_GET, handlePortalRoot);
     server.on("/save", HTTP_POST, handlePortalSave);
+    server.on("/pattern", HTTP_GET, []() {
+        String p = last_burst; last_burst = "";
+        server.send(200, "application/json", "{\"pattern\":\"" + p + "\"}");
+    });
     server.onNotFound(handlePortalRoot);
     server.begin();
     Serial.println("Portal: SSID=KineticSwitch  192.168.4.1");
