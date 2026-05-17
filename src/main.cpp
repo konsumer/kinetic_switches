@@ -1,340 +1,406 @@
-#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <SPI.h>
 #include <RadioLib.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+#include <driver/rmt.h>
+#include <vector>
+#include "portal_html.h"
 
-#define SYMBOL_US  35    // measured from IQ captures: ~35µs per symbol
-#define TOLERANCE  40    // percent
-#define SIG_BITS   25
+#define SYMBOL_US        35
+#define TOLERANCE        40
+#define REFIRE_GUARD_MS  1500
+#define PORTAL_HOLD_MS   3000
 
-// #define DEBUG_TIMING   // pulse histograms
-// #define CAPTURE_MODE   // dump raw µs timings + classified string, no matching
-                          // use this to compare CC1101 captures against URH/PlutoSDR
-
-// ---- Detector base class -------------------------------------------------------
+// ---- KineticSwitch -------------------------------------------------------------
 
 class KineticSwitch {
 public:
-    int id;
-    const char* name;
-    KineticSwitch(int id, const char* name) : id(id), name(name) {}
-    virtual bool match(const char* buf, int len) = 0;
+    String   name;
+    String   url;
+    uint32_t lastPressMs = 0;
+    KineticSwitch(const char* n, const char* u = "") : name(n), url(u) {}
+    virtual bool        match(const char* buf, int len) = 0;
+    virtual const char* pattern() = 0;
+    bool isPresent() { return lastPressMs > 0 && (millis() - lastPressMs) < PRESENCE_TIMEOUT_MS; }
 };
 
-// Sliding-window full-signature match with Hamming tolerance.
-// maxErr=1 handles a single misclassified symbol.
-class SigSwitch : public KineticSwitch {
-    uint32_t sig;
-    int maxErr;
-public:
-    SigSwitch(int id, const char* name, uint32_t sig, int maxErr = 1)
-        : KineticSwitch(id, name), sig(sig), maxErr(maxErr) {}
-
-    bool match(const char* buf, int len) override {
-        for (int s = 0; s <= len - SIG_BITS; s++) {
-            uint32_t v = 0;
-            bool ok = true;
-            for (int j = 0; j < SIG_BITS; j++) {
-                char c = buf[s + j];
-                if (c != '8' && c != 'e') { ok = false; break; }
-                v = (v << 1) | (c == 'e' ? 1 : 0);
-            }
-            if (ok && __builtin_popcount(v ^ sig) <= maxErr) return true;
-        }
-        return false;
-    }
-
-    static constexpr uint32_t makeSig(const char* s) {
-        uint32_t v = 0;
-        for (int i = 0; s[i]; i++)
-            v = (v << 1) | (s[i] == 'e' ? 1 : 0);
-        return v;
-    }
-};
-
-// Substring match — for devices where only a partial pattern is known.
 class PatternSwitch : public KineticSwitch {
-    const char* pat;
+    String _pat;
 public:
-    PatternSwitch(int id, const char* name, const char* pat)
-        : KineticSwitch(id, name), pat(pat) {}
-    bool match(const char* buf, int len) override {
-        return strstr(buf, pat) != nullptr;
+    PatternSwitch(const char* n, const char* p, const char* u = "") : KineticSwitch(n, u), _pat(p) {}
+    const char* pattern() override { return _pat.c_str(); }
+    bool match(const char* buf, int) override { return strstr(buf, _pat.c_str()) != nullptr; }
+};
+
+// ---- Config / NVS --------------------------------------------------------------
+
+Preferences prefs;
+String      wifi_ssid, wifi_pass;
+std::vector<KineticSwitch*> switches;
+bool     has_ip_cache = false;
+uint32_t cached_ip = 0, cached_gw = 0, cached_sn = 0, cached_dns = 0;
+
+void loadConfig() {
+    prefs.begin("ks", true);
+    wifi_ssid    = prefs.getString("ssid", "");
+    wifi_pass    = prefs.getString("pass", "");
+    String sw_j  = prefs.getString("sw",   "[]");
+    has_ip_cache = prefs.getBool("ipc", false);
+    cached_ip    = prefs.getUInt("ip",  0);
+    cached_gw    = prefs.getUInt("gw",  0);
+    cached_sn    = prefs.getUInt("sn",  0);
+    cached_dns   = prefs.getUInt("dns", 0);
+    prefs.end();
+
+    Serial.printf("loadConfig: ssid='%s' sw_j='%s'\n", wifi_ssid.c_str(), sw_j.c_str());
+    for (auto s : switches) delete s;
+    switches.clear();
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, sw_j);
+    if (err) {
+        Serial.printf("loadConfig: JSON parse error: %s\n", err.c_str());
+    } else if (!doc.is<JsonArray>()) {
+        Serial.println("loadConfig: JSON is not array");
+    } else {
+        for (JsonObject o : doc.as<JsonArray>()) {
+            const char* n = o["n"]; const char* p = o["p"]; const char* u = o["u"];
+            Serial.printf("loadConfig: sw n='%s' p='%s' u='%s'\n", n?n:"null", p?p:"null", u?u:"");
+            if (n && p) switches.push_back(new PatternSwitch(n, p, u ? u : ""));
+        }
     }
-};
+    if (switches.empty()) {
+        Serial.println("loadConfig: no switches in NVS, using defaults");
+        switches.push_back(new PatternSwitch("Switch A", "8e8e88e88888", ""));
+        switches.push_back(new PatternSwitch("Switch B", "eeeee8888e8e8888", ""));
+        switches.push_back(new PatternSwitch("Switch C", "eeeee888888ee888", ""));
+    }
+}
 
-// ---- Switch list ---------------------------------------------------------------
+void saveConfig() {
+    JsonDocument doc; JsonArray arr = doc.to<JsonArray>();
+    for (auto s : switches) {
+        JsonObject o = arr.add<JsonObject>();
+        o["n"] = s->name.c_str();
+        o["p"] = s->pattern();
+        o["u"] = s->url.c_str();
+    }
+    String sw_j; serializeJson(doc, sw_j);
+    Serial.printf("saveConfig: ssid='%s' sw_j='%s'\n", wifi_ssid.c_str(), sw_j.c_str());
+    prefs.begin("ks", false);
+    prefs.putString("ssid", wifi_ssid);
+    prefs.putString("pass", wifi_pass);
+    bool ok = prefs.putString("sw", sw_j);
+    Serial.printf("saveConfig: putString sw -> %s\n", ok ? "ok" : "FAIL");
+    prefs.end();
+}
 
-// Full 25-char OOK packets from IQ captures (8=0, e=1):
-//   A: 8e8e88e88888eeee88ee888e8  — unique prefix
-//   B: 8eeee88eeeee8888e8e8888e8  — unique suffix pos 12-22
-//   C: 8eeee88eeeee888888ee888e8  — unique suffix pos 12-22
-// Short unique substrings used for robustness against timing jitter.
-// SigSwitch available for full-signature matching when captures are verified.
-KineticSwitch* switches[] = {
-    new PatternSwitch(1, "Switch A", "8e8e88e88888"),      // unique prefix (12 chars)
-    new PatternSwitch(2, "Switch B", "eeeee8888e8e8888"),  // preamble-end + unique suffix (16 chars)
-    new PatternSwitch(3, "Switch C", "eeeee888888ee888"),  // preamble-end + unique suffix (16 chars)
-};
-#define N_SW (sizeof(switches) / sizeof(switches[0]))
+void saveIpCache() {
+    prefs.begin("ks", false);
+    prefs.putBool("ipc", true);
+    prefs.putUInt("ip",  (uint32_t)WiFi.localIP());
+    prefs.putUInt("gw",  (uint32_t)WiFi.gatewayIP());
+    prefs.putUInt("sn",  (uint32_t)WiFi.subnetMask());
+    prefs.putUInt("dns", (uint32_t)WiFi.dnsIP());
+    prefs.end();
+    has_ip_cache = true;
+    Serial.println("DHCP cached");
+}
+
+// ---- CC1101 / RMT --------------------------------------------------------------
 
 SPIClass spi(FSPI);
 CC1101 radio = new Module(PIN_CS, PIN_GDO0, RADIOLIB_NC, PIN_GDO2, spi);
 
-// ---- CC1101 SPI helpers --------------------------------------------------------
-
-static uint8_t cc1101_read(uint8_t addr) {
-  spi.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
-  digitalWrite(PIN_CS, LOW);
-  spi.transfer(addr | 0x80);
-  uint8_t val = spi.transfer(0x00);
-  digitalWrite(PIN_CS, HIGH);
-  spi.endTransaction();
-  return val;
-}
-
 static uint8_t cc1101_read_status(uint8_t addr) {
-  spi.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
-  digitalWrite(PIN_CS, LOW);
-  spi.transfer(addr | 0xC0);
-  uint8_t val = spi.transfer(0x00);
-  digitalWrite(PIN_CS, HIGH);
-  spi.endTransaction();
-  return val;
+    spi.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(PIN_CS, LOW);
+    spi.transfer(addr | 0xC0);
+    uint8_t v = spi.transfer(0);
+    digitalWrite(PIN_CS, HIGH);
+    spi.endTransaction();
+    return v;
 }
 
 static void cc1101_write(uint8_t addr, uint8_t val) {
-  spi.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
-  digitalWrite(PIN_CS, LOW);
-  spi.transfer(addr & 0x3F);
-  spi.transfer(val);
-  digitalWrite(PIN_CS, HIGH);
-  spi.endTransaction();
+    spi.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(PIN_CS, LOW);
+    spi.transfer(addr & 0x3F);
+    spi.transfer(val);
+    digitalWrite(PIN_CS, HIGH);
+    spi.endTransaction();
 }
 
-// ---- Pulse timing ISR ----------------------------------------------------------
+#define MAX_NIB          128
+#define RMT_RX_CHANNEL   RMT_CHANNEL_0
+#define RMT_CLK_DIV      80
+#define RMT_IDLE_US      500
 
-#define MAX_NIB 128
-volatile char     nib_buf[MAX_NIB + 1];
-volatile int      nib_cnt      = 0;
-volatile bool     pkt_rdy      = false;
-volatile bool     carrier_present = false;
-volatile uint32_t rise_t       = 0;
-volatile uint32_t last_valid_t = 0;
-volatile uint32_t isr_fires    = 0;
-
-#if defined(DEBUG_TIMING) || defined(CAPTURE_MODE)
-volatile uint32_t dbg_us[MAX_NIB];
-volatile int      dbg_cnt = 0;
-#endif
+volatile bool carrier_present = false;
+RingbufHandle_t rmtRingBuf    = nullptr;
 
 static inline char classify(uint32_t us) {
-  if (us < 15) return '?';
-  static const struct { uint8_t mult; char ch; } syms[] = {
-    {1,'8'}, {3,'e'}, {4,'f'}, {8,'F'}
-  };
-  char best = '?';
-  uint32_t best_err = UINT32_MAX;
-  for (int i = 0; i < 4; i++) {
-    uint32_t target = (uint32_t)SYMBOL_US * syms[i].mult;
-    uint32_t tol    = target * TOLERANCE / 100;
-    uint32_t err    = us > target ? us - target : target - us;
-    if (err <= tol && err < best_err) { best = syms[i].ch; best_err = err; }
-  }
-  return best;
-}
-
-void IRAM_ATTR gdo0_data_isr() {
-  if (!carrier_present) return;  // gate: ignore all GDO0 data when no carrier
-  isr_fires++;
-  uint32_t t = micros();
-  if (digitalRead(PIN_GDO0)) {
-    rise_t = t;
-  } else {
-    uint32_t high_us = t - rise_t;
-#if defined(DEBUG_TIMING) || defined(CAPTURE_MODE)
-    if (!pkt_rdy && dbg_cnt < MAX_NIB)
-      dbg_us[dbg_cnt++] = high_us;
-#endif
-    if (!pkt_rdy && nib_cnt < MAX_NIB) {
-      char c = classify(high_us);
-      if (c != '?') {
-        nib_buf[nib_cnt++] = c;
-        last_valid_t = t;
-      }
+    if (us < 15) return '?';
+    static const struct { uint8_t mult; char ch; } syms[] = {
+        {1,'8'},{3,'e'},{4,'f'},{8,'F'}
+    };
+    char best = '?'; uint32_t best_err = UINT32_MAX;
+    for (int i = 0; i < 4; i++) {
+        uint32_t target = (uint32_t)SYMBOL_US * syms[i].mult;
+        uint32_t tol    = target * TOLERANCE / 100;
+        uint32_t err    = us > target ? us - target : target - us;
+        if (err <= tol && err < best_err) { best = syms[i].ch; best_err = err; }
     }
-  }
+    return best;
 }
 
-// GDO2 = carrier sense (CHANGE): rising = carrier appeared, falling = burst done.
 void IRAM_ATTR gdo2_cs_isr() {
-  carrier_present = digitalRead(PIN_GDO2);
-  if (carrier_present) {
-    nib_cnt = 0;  // fresh burst starting, discard any accumulated noise
-  } else if (nib_cnt > 4) {
-    pkt_rdy = true;
-  }
+    carrier_present = digitalRead(PIN_GDO2);
+}
+
+// ---- URL trigger ---------------------------------------------------------------
+
+void callUrl(const String& url) {
+    if (url.isEmpty()) return;
+    HTTPClient http;
+    if (url.startsWith("https")) {
+        static WiFiClientSecure sc;
+        sc.setInsecure();
+        http.begin(sc, url);
+    } else {
+        http.begin(url);
+    }
+    int code = http.GET();
+    Serial.printf("URL → %d\n", code);
+    http.end();
+}
+
+// ---- Burst processing ----------------------------------------------------------
+
+void processBurst(char* expanded, int ei) {
+    static int      last_sw      = -1;
+    static uint32_t last_fire_ms = 0;
+    for (int i = 0; i < (int)switches.size(); i++) {
+        if (!switches[i]->match(expanded, ei)) continue;
+        uint32_t now_ms = millis();
+        if (i == last_sw && (now_ms - last_fire_ms) < REFIRE_GUARD_MS) break;
+        switches[i]->lastPressMs = now_ms;
+        Serial.printf(">>> %s\n", switches[i]->name.c_str());
+        callUrl(switches[i]->url);
+        last_sw = i; last_fire_ms = now_ms;
+        break;
+    }
+}
+
+bool tryProcessPacket() {
+    if (!rmtRingBuf) return false;
+    size_t rx_size;
+    rmt_item32_t* items = (rmt_item32_t*)xRingbufferReceive(rmtRingBuf, &rx_size, 0);
+    if (!items) return false;
+
+    if (!carrier_present) {
+        vRingbufferReturnItem(rmtRingBuf, items);
+        return false;
+    }
+
+    int n = rx_size / sizeof(rmt_item32_t);
+    char expanded[MAX_NIB * 2 + 2];
+    int ei = 0;
+    for (int j = 0; j < n && ei < (int)sizeof(expanded) - 2; j++) {
+        uint32_t us = items[j].level0 ? items[j].duration0 : items[j].duration1;
+        char c = classify(us);
+        if (c == 'F') { expanded[ei++] = 'f'; expanded[ei++] = 'f'; }
+        else if (c != '?') expanded[ei++] = c;
+    }
+    expanded[ei] = '\0';
+    vRingbufferReturnItem(rmtRingBuf, items);
+
+    if (ei >= 8) processBurst(expanded, ei);
+    return true;
+}
+
+// ---- Captive portal ------------------------------------------------------------
+
+WebServer server(80);
+
+void handlePortalRoot() {
+    int n = WiFi.scanNetworks();
+    String opts;
+    for (int i = 0; i < n; i++) {
+        String s = WiFi.SSID(i);
+        String sel = (s == wifi_ssid) ? " selected" : "";
+        opts += "<option value=\"" + s + "\"" + sel + ">" + s + " (" + WiFi.RSSI(i) + " dBm)</option>\n";
+    }
+    WiFi.scanDelete();
+    JsonDocument doc; JsonArray arr = doc.to<JsonArray>();
+    for (auto sw : switches) {
+        JsonObject o = arr.add<JsonObject>();
+        o["name"]    = sw->name.c_str();
+        o["pattern"] = sw->pattern();
+        o["url"]     = sw->url.c_str();
+    }
+    String swJson; serializeJson(doc, swJson);
+    String html = String(PORTAL_HTML);
+    html.replace("{{WIFI_OPTIONS}}", opts);
+    html.replace("{{SSID}}", wifi_ssid);
+    html.replace("{{PASS}}", wifi_pass);
+    html.replace("{{SWITCHES_JSON}}", swJson);
+    server.send(200, "text/html", html);
+}
+
+void handlePortalSave() {
+    if (!server.hasArg("plain")) { server.send(400, "text/plain", "Missing body"); return; }
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain"))) { server.send(400, "text/plain", "Bad JSON"); return; }
+    wifi_ssid = doc["ssid"] | "";
+    wifi_pass = doc["password"] | "";
+    for (auto s : switches) delete s;
+    switches.clear();
+    for (JsonObject sw : doc["switches"].as<JsonArray>()) {
+        const char* nm = sw["name"]; const char* pt = sw["pattern"]; const char* u = sw["url"];
+        if (nm && pt && strlen(nm) && strlen(pt))
+            switches.push_back(new PatternSwitch(nm, pt, u ? u : ""));
+    }
+    saveConfig();
+    server.send(200, "application/json", "{\"status\":\"ok\"}");
+    delay(1000); ESP.restart();
+}
+
+void startCaptivePortal() {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP("KineticSwitch");
+    delay(100);
+    DNSServer dns;
+    dns.start(53, "*", IPAddress(192, 168, 4, 1));
+    server.on("/", HTTP_GET, handlePortalRoot);
+    server.on("/save", HTTP_POST, handlePortalSave);
+    server.onNotFound(handlePortalRoot);
+    server.begin();
+    Serial.println("Portal: SSID=KineticSwitch  192.168.4.1");
+    while (true) { dns.processNextRequest(); server.handleClient(); tryProcessPacket(); delay(5); }
+}
+
+// ---- Radio setup ---------------------------------------------------------------
+
+void setupRadio() {
+    spi.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
+    int state = radio.begin();
+    Serial.printf("CC1101: %s (%d)\n", state == RADIOLIB_ERR_NONE ? "OK" : "FAIL", state);
+    if (state != RADIOLIB_ERR_NONE) while (1) delay(100);
+    radio.setFrequency(433.92);
+    radio.setOOK(true);
+    radio.setBitRate(28.6);
+    radio.setRxBandwidth(200.0);
+    state = radio.receiveDirectAsync();
+    Serial.printf("receiveDirectAsync: %s (%d)\n", state == RADIOLIB_ERR_NONE ? "OK" : "FAIL", state);
+    if (state != RADIOLIB_ERR_NONE) while (1) delay(100);
+    cc1101_write(0x07, 0x06);
+    cc1101_write(0x1B, 0xC7);
+    cc1101_write(0x1C, 0x00);
+    cc1101_write(0x1D, 0xB2);
+    cc1101_write(0x00, 0x0E);
+
+    rmt_config_t rmtCfg = {};
+    rmtCfg.rmt_mode                      = RMT_MODE_RX;
+    rmtCfg.channel                       = RMT_RX_CHANNEL;
+    rmtCfg.gpio_num                      = (gpio_num_t)PIN_GDO0;
+    rmtCfg.clk_div                       = RMT_CLK_DIV;
+    rmtCfg.mem_block_num                 = 4;
+    rmtCfg.rx_config.idle_threshold      = RMT_IDLE_US;
+    rmtCfg.rx_config.filter_en           = true;
+    rmtCfg.rx_config.filter_ticks_thresh = 10;
+    rmt_config(&rmtCfg);
+    rmt_driver_install(RMT_RX_CHANNEL, 4096, 0);
+    rmt_get_ringbuf_handle(RMT_RX_CHANNEL, &rmtRingBuf);
+    rmt_rx_start(RMT_RX_CHANNEL, true);
+
+    pinMode(PIN_GDO2, INPUT);
+    attachInterrupt(digitalPinToInterrupt(PIN_GDO2), gdo2_cs_isr, CHANGE);
+}
+
+// ---- WiFi connect --------------------------------------------------------------
+
+void wifiConnect() {
+    WiFi.mode(WIFI_STA);
+    if (has_ip_cache)
+        WiFi.config(IPAddress(cached_ip), IPAddress(cached_gw),
+                    IPAddress(cached_sn), IPAddress(cached_dns));
+    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+    Serial.print("WiFi: connecting");
+    while (WiFi.status() != WL_CONNECTED) { delay(250); Serial.print("."); }
+    Serial.printf("\nWiFi up: %s\n", WiFi.localIP().toString().c_str());
+    if (!has_ip_cache) saveIpCache();
 }
 
 // ---- Setup / Loop --------------------------------------------------------------
 
 void setup() {
-  Serial.begin(115200);
-  uint32_t t0 = millis();
-  while (!Serial && millis() - t0 < 3000) delay(10);
-  Serial.println("\n=== kinetic switch detector ===");
+    Serial.begin(115200);
+    uint32_t t0 = millis();
+    while (!Serial && millis() - t0 < 3000) delay(10);
+    Serial.println("\n=== kinetic switch detector ===");
 
-  spi.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
+    pinMode(PIN_LED, OUTPUT);
+    pinMode(PIN_BOOT, INPUT_PULLUP);
+    delay(100);
 
-  int state = radio.begin();
-  Serial.printf("CC1101 begin:           %s (code %d)\n",
-    state == RADIOLIB_ERR_NONE ? "OK" : "FAIL", state);
-  if (state != RADIOLIB_ERR_NONE) { while (1) delay(100); }
+    loadConfig();
+    setupRadio();
 
-  state = radio.setFrequency(433.92);
-  Serial.printf("setFrequency(433.92):   %s (code %d)\n",
-    state == RADIOLIB_ERR_NONE ? "OK" : "FAIL", state);
+    bool enterPortal = wifi_ssid.isEmpty();
+    if (!enterPortal && digitalRead(PIN_BOOT) == LOW) {
+        Serial.printf("Boot held — hold %dms for portal\n", PORTAL_HOLD_MS);
+        uint32_t held = millis();
+        while (digitalRead(PIN_BOOT) == LOW && millis() - held < PORTAL_HOLD_MS) delay(50);
+        enterPortal = (digitalRead(PIN_BOOT) == LOW);
+    }
+    if (enterPortal) { startCaptivePortal(); } // never returns
 
-  state = radio.setOOK(true);
-  Serial.printf("setOOK:                 %s (code %d)\n",
-    state == RADIOLIB_ERR_NONE ? "OK" : "FAIL", state);
-
-  state = radio.setBitRate(28.6);
-  Serial.printf("setBitRate(28.6):       %s (code %d)\n",
-    state == RADIOLIB_ERR_NONE ? "OK" : "FAIL", state);
-
-  state = radio.setRxBandwidth(200.0);
-  Serial.printf("setRxBandwidth(200.0):  %s (code %d)\n",
-    state == RADIOLIB_ERR_NONE ? "OK" : "FAIL", state);
-
-  state = radio.receiveDirectAsync();
-  Serial.printf("receiveDirectAsync:     %s (code %d)\n",
-    state == RADIOLIB_ERR_NONE ? "OK" : "FAIL", state);
-  if (state != RADIOLIB_ERR_NONE) { while (1) delay(100); }
-
-  // Maximize sensitivity — critical for weak kinetic switch signals.
-  // Reference: billmaterial/ESP-Home-CC1101-Kinetic-Switch-Transceiver
-  cc1101_write(0x07, 0x06);  // FSCTRL1: IF = 152 kHz
-  cc1101_write(0x1B, 0xC7);  // AGCCTRL2: max LNA + DVGA gain, 42dB target
-  cc1101_write(0x1C, 0x00);  // AGCCTRL1: no relative carrier sense threshold
-  cc1101_write(0x1D, 0xB2);  // AGCCTRL0: medium hysteresis, 16 samples wait
-
-  cc1101_write(0x00, 0x0E);  // IOCFG2: GDO2 = carrier sense
-
-  Serial.printf("--- CC1101 register readback ---\n");
-  Serial.printf("  IOCFG2   (0x00) = 0x%02X (want 0x0E carrier sense)\n", cc1101_read(0x00));
-  Serial.printf("  IOCFG0   (0x02) = 0x%02X (want 0x0D async data on GDO0)\n", cc1101_read(0x02));
-  Serial.printf("  PKTCTRL0 (0x08) = 0x%02X (want 0x32 async serial)\n", cc1101_read(0x08));
-  Serial.printf("  MDMCFG2  (0x12) = 0x%02X (want 0x30 OOK, no sync)\n", cc1101_read(0x12));
-  Serial.printf("  AGCCTRL2 (0x1B) = 0x%02X (want 0xC7 max gain)\n", cc1101_read(0x1B));
-
-  uint8_t marc = cc1101_read_status(0x35) & 0x1F;
-  Serial.printf("MARCSTATE:              0x%02X (%s)\n", marc, marc == 0x0D ? "RX OK" : "NOT RX");
-
-  pinMode(PIN_GDO0, INPUT);
-  pinMode(PIN_GDO2, INPUT);
-  pinMode(PIN_LED, OUTPUT);
-  attachInterrupt(digitalPinToInterrupt(PIN_GDO0), gdo0_data_isr, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(PIN_GDO2), gdo2_cs_isr, CHANGE);
-
-  Serial.println("Listening — press a switch...\n");
+    wifiConnect();
+    Serial.println("Radio listening.");
 }
 
 void loop() {
-  static int      peak_rssi   = -120;
-  static uint32_t last_hb     = 0;
-  static uint32_t prev_fires  = 0;
-  uint32_t now = millis();
+    static int      peak_rssi = -120;
+    static uint32_t last_hb   = 0;
+    uint32_t now = millis();
 
-  {
-    uint8_t rssi_raw = cc1101_read_status(0x34);
-    int rssi_dbm = (rssi_raw >= 128) ? (rssi_raw - 256) / 2 - 74
-                                      : rssi_raw / 2 - 74;
-    if (rssi_dbm > peak_rssi) peak_rssi = rssi_dbm;
-  }
+    {
+        uint8_t rssi_raw = cc1101_read_status(0x34);
+        int rssi_dbm = (rssi_raw >= 128) ? (rssi_raw - 256) / 2 - 74 : rssi_raw / 2 - 74;
+        if (rssi_dbm > peak_rssi) peak_rssi = rssi_dbm;
+    }
 
-  if (now - last_hb > 5000) {
-    uint32_t fires_now = isr_fires;
-    uint32_t rate = (fires_now - prev_fires) / 5;
-    prev_fires = fires_now;
-    last_hb = now;
+    if (now - last_hb > 5000) {
+        Serial.printf("[hb] peak=%ddBm carrier=%d\n", peak_rssi, (int)carrier_present);
+        last_hb = now; peak_rssi = -120;
+    }
 
-    uint8_t marc = cc1101_read_status(0x35) & 0x1F;
-    Serial.printf("[hb] edges/s=%lu peak_RSSI=%ddBm GDO0=%d GDO2=%d state=0x%02X\n",
-      rate, peak_rssi, digitalRead(PIN_GDO0), digitalRead(PIN_GDO2), marc);
-    peak_rssi = -120;
-  }
+    tryProcessPacket();
 
-  if (!pkt_rdy && nib_cnt >= MAX_NIB)  // buffer full = process now
-    pkt_rdy = true;
-  if (!pkt_rdy) return;
+    {
+        static uint32_t boot_press_ms = 0;
+        if (digitalRead(PIN_BOOT) == LOW) {
+            if (!boot_press_ms) boot_press_ms = millis();
+            else if (millis() - boot_press_ms > PORTAL_HOLD_MS) {
+                Serial.println("BOOT held — entering portal");
+                startCaptivePortal(); // never returns; restarts after save
+            }
+        } else {
+            boot_press_ms = 0;
+        }
+    }
 
-  noInterrupts();
-  char buf[MAX_NIB + 1];
-  int  len = nib_cnt;
-  memcpy(buf, (void*)nib_buf, len);
-  buf[len] = '\0';
-  nib_cnt  = 0;
-  pkt_rdy  = false;
-  interrupts();
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi: lost, reconnecting");
+        wifiConnect();
+    }
 
-  if (len < 8) return;
-
-#if defined(DEBUG_TIMING) || defined(CAPTURE_MODE)
-  noInterrupts();
-  int dcnt = dbg_cnt;
-  uint32_t dtmp[MAX_NIB];
-  memcpy(dtmp, (void*)dbg_us, dcnt * sizeof(uint32_t));
-  dbg_cnt = 0;
-  interrupts();
-#endif
-
-  char expanded[MAX_NIB * 2 + 1];
-  int ei = 0;
-  for (int i = 0; i < len && ei < (int)sizeof(expanded) - 2; i++) {
-    if (buf[i] == 'F') { expanded[ei++] = 'f'; expanded[ei++] = 'f'; }
-    else                  expanded[ei++] = buf[i];
-  }
-  expanded[ei] = '\0';
-
-#ifdef CAPTURE_MODE
-  // Print raw µs pulse widths (what URH sees internally) + classified string.
-  // Press a switch, compare this output against your PlutoSDR/URH capture.
-  Serial.printf("burst: %s\n", expanded);
-  Serial.print("timings(us):");
-  for (int i = 0; i < dcnt; i++) Serial.printf(" %lu", dtmp[i]);
-  Serial.println();
-  return;  // no matching in capture mode
-#endif
-
-#ifdef DEBUG_TIMING
-  uint8_t hist[50] = {};
-  int noise_cnt = 0;
-  for (int i = 0; i < dcnt; i++) {
-    if (dtmp[i] < 15) { noise_cnt++; continue; }
-    int b = dtmp[i] / 20;
-    if (b < 50) hist[b]++;
-  }
-  Serial.printf("  noise(<15us)=%d histogram(20us buckets):\n", noise_cnt);
-  for (int b = 0; b < 50; b++) {
-    if (hist[b] == 0) continue;
-    Serial.printf("  %3d-%3d us: %d\n", b*20, b*20+19, hist[b]);
-  }
-#endif
-
-  static int      last_sw      = -1;
-  static uint32_t last_fire_ms = 0;
-  #define REFIRE_GUARD_MS 1500
-
-  for (int i = 0; i < (int)N_SW; i++) {
-    if (!switches[i]->match(expanded, ei)) continue;
-    uint32_t now_ms = millis();
-    if (i == last_sw && (now_ms - last_fire_ms) < REFIRE_GUARD_MS) break;
-    Serial.printf(">>> %s pressed! (burst: %s)\n", switches[i]->name, expanded);
-    digitalWrite(PIN_LED, HIGH);
-    delay(100);
-    digitalWrite(PIN_LED, LOW);
-    last_sw      = i;
-    last_fire_ms = now_ms;
-    break;
-  }
+    static uint32_t led_on_ms = 0;
+    for (auto sw : switches) if (sw->lastPressMs > led_on_ms) led_on_ms = sw->lastPressMs;
+    digitalWrite(PIN_LED, (led_on_ms && millis() - led_on_ms < 100) ? HIGH : LOW);
 }

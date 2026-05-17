@@ -2,8 +2,10 @@ This is a device that turns kinetic (no battery) switches into wifi smart-switch
 
 ### setup
 
-Maybe at some point I will work out a detection routine for it (enter "detect mode", press a button, store ID) but it works for me to just modify the code. These switches vary widely, so you may have to work something else out, entirely, and even if they are identical, you will need to capture the IDs of yours, in [Universal Radio Hacker](https://github.com/jopohl/urh). Read [NOTES](NOTES.md) to see how I figured it out.
-
+- Enable [URL Routine Trigger](https://www.amazon.com/dp/B0BD8PP22L/)
+- Go to [trigger admin](https://www.virtualsmarthome.xyz/url_routine_trigger/) and add a URL for each button
+- capture the identifiers of each switch (use URH with rtlsdr.) Read [NOTES](NOTES.md) to see how I figured it out.
+- hold "BOOT" to restart in "config mode" connect to KiteticSwitch wifi and setup wifi & id/triggers (in portal window that pops up)
 
 ### upload
 
